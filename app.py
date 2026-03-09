@@ -202,7 +202,7 @@ if st.session_state.opt_run_complete:
             with st.spinner("Synthesizing financial data..."):
                 try:
                     genai.configure(api_key=api_key)
-                    model = genai.GenerativeModel('gemini-1.5-flash')
+                    model = genai.GenerativeModel('gemini-2.5-flash')
                     metrics = st.session_state.financial_metrics
                     prompt = f"""
                     Act as an energy strategy consultant. Analyze the following BESS financial metrics and provide a 2-paragraph executive summary on the project viability.
