@@ -210,7 +210,7 @@ if st.session_state.opt_run_complete:
                     Context: The system optimizes revenue by charging from zero-cost curtailed renewable energy and discharging during high nodal prices, avoiding negative pricing penalties. Focus strictly on financial and strategic implications. Do not use positive framing. Maintain a factual tone.
                     """
                     response = model.generate_content(prompt)
-                    st.write(response.text)
+                    st.write(response.text.replace('$', r'\$'))
                 except Exception as e:
                     st.error(f"API Error: {e}")
     else:
