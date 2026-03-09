@@ -38,7 +38,11 @@ project_lifespan = st.sidebar.number_input("Project Lifespan (Years)", min_value
 itc_percentage = st.sidebar.number_input("ITC Percentage (%)", min_value=0.0, max_value=100.0, value=30.0, step=1.0)
 
 st.sidebar.subheader("AI Integrations")
-api_key = st.sidebar.text_input("Gemini API Key", type="password", help="Required for Module D")
+try:
+    api_key = st.secrets["GEMINI_API_KEY"]
+    st.sidebar.success("AI Strategy Advisor: Active (Securely Connected)")
+except KeyError:
+    api_key = st.sidebar.text_input("Gemini API Key", type="password", help="Required for Module D if secrets are not configured")
 
 @st.cache_data
 def generate_energy_data(seed: int = 42) -> pd.DataFrame:
