@@ -4,4 +4,7 @@ __pycache__/
 .cache/
 .DS_Store
 .claude/
+
+# Exclude local Parquet cache, but allow checked-in pre-fetched OASIS data
 *.parquet
+!data/*_cached_oasis.parquet

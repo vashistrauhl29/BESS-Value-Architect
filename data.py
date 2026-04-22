@@ -20,6 +20,7 @@ clauses typical of CA PPAs from the 2019-2021 vintage).
 from __future__ import annotations
 
 import io
+import time
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime
@@ -63,6 +64,17 @@ def _fallback_path(node_code: str, year: int) -> Path:
 
 def _cache_path(node_code: str, year: int) -> Path:
     return CACHE_DIR / f"{node_code}_{year}.parquet"
+
+
+def _bundled_parquet_path(node_code: str, year: int) -> Path:
+    """Repo-shipped pre-fetched OASIS cache (optional).
+
+    If committed to the repo at ``data/<node>_<year>_cached_oasis.parquet``,
+    this file is preferred over live OASIS on cold-start (which typically
+    gets rate-limited on shared cloud egress IPs). Generated locally by
+    running the fetch patiently, then checked in.
+    """
+    return FALLBACK_DIR / f"{node_code}_{year}_cached_oasis.parquet"
 
 
 def _generate_fallback(node_code: str, year: int) -> pd.DataFrame:
@@ -149,7 +161,10 @@ def _ensure_fallback(node_code: str, year: int) -> Path:
 
 
 def _fetch_oasis_month(node_code: str, year: int, month: int,
-                       timeout: int = 30) -> Optional[pd.DataFrame]:
+                       timeout: int = 30) -> tuple[Optional[pd.DataFrame], Optional[str]]:
+    """One-shot monthly fetch. Returns (df, None) on success or
+    (None, error_reason) on failure. No retries here — retries live at
+    the year-level orchestrator so rate-limit backoff can be applied."""
     start = f"{year}{month:02d}01T08:00-0000"
     nxt_m = month + 1 if month < 12 else 1
     nxt_y = year if month < 12 else year + 1
@@ -165,41 +180,91 @@ def _fetch_oasis_month(node_code: str, year: int, month: int,
     }
     try:
         r = requests.get(OASIS_BASE, params=params, timeout=timeout)
-        r.raise_for_status()
-    except requests.RequestException:
-        return None
+    except requests.RequestException as e:
+        return None, f"network {type(e).__name__}"
+    if r.status_code == 429:
+        return None, "HTTP 429 rate-limited"
+    if 500 <= r.status_code < 600:
+        return None, f"HTTP {r.status_code} server error"
+    if r.status_code != 200:
+        return None, f"HTTP {r.status_code}"
     try:
         z = zipfile.ZipFile(io.BytesIO(r.content))
         csv_members = [n for n in z.namelist() if n.endswith(".csv")]
         if not csv_members:
-            return None
+            return None, "no CSV in zip"
         with z.open(csv_members[0]) as f:
             m = pd.read_csv(f)
-    except (zipfile.BadZipFile, ValueError):
-        return None
+    except (zipfile.BadZipFile, ValueError) as e:
+        return None, f"parse {type(e).__name__}"
     if "LMP_TYPE" not in m.columns:
-        return None
+        return None, "missing LMP_TYPE column"
     m = m[m["LMP_TYPE"] == "LMP"].copy()
     price_col = "MW" if "MW" in m.columns else "VALUE"
     if price_col not in m.columns or "INTERVALSTARTTIME_GMT" not in m.columns:
-        return None
+        return None, "missing required columns"
     m["ts"] = pd.to_datetime(m["INTERVALSTARTTIME_GMT"], utc=True)
-    return m[["ts", price_col]].rename(columns={price_col: "Nodal_Price_$/MWh"})
+    return (
+        m[["ts", price_col]].rename(columns={price_col: "Nodal_Price_$/MWh"}),
+        None,
+    )
 
 
-def _fetch_oasis_year(node_code: str, year: int) -> Optional[pd.DataFrame]:
+# CAISO OASIS burst limit observed empirically: ~1 request per 5 seconds
+# per IP (when server is warm, a second immediate request returns 429; by
+# the 8th rapid request the response comes back as an XML error envelope
+# inside the zip rather than data). On Streamlit Cloud the egress IP is
+# shared across free-tier apps, so the throttle state is usually already
+# partially exhausted before our requests start.
+_OASIS_RATE_LIMIT_S = 5.5      # conservative inter-request spacing
+_OASIS_MAX_RETRIES = 5         # retries per month with backoff
+_OASIS_BACKOFF_BASE_S = 8.0    # first backoff 8s, then 16s, 32s, 64s
+
+
+def _fetch_oasis_year(node_code: str, year: int,
+                       rate_limit_s: float = _OASIS_RATE_LIMIT_S,
+                       max_retries: int = _OASIS_MAX_RETRIES,
+                       ) -> tuple[Optional[pd.DataFrame], str]:
+    """Fetch a full calendar year with rate-limiting and per-month retries.
+
+    Returns (df, status_message). status_message is either "ok" or a
+    user-readable description of which months failed and why. Up to one
+    failed month is tolerated (the fetch proceeds with the 11 good months
+    concatenated — the year-length check below will likely reject this,
+    but the status message still surfaces the failure reason to the UI).
+    """
     frames: list[pd.DataFrame] = []
+    failures: list[str] = []
+
     for month in range(1, 13):
-        m = _fetch_oasis_month(node_code, year, month)
-        if m is None:
-            return None
-        frames.append(m)
+        df_m: Optional[pd.DataFrame] = None
+        last_err = "unknown"
+        for attempt in range(max_retries):
+            if attempt > 0:
+                time.sleep(_OASIS_BACKOFF_BASE_S * (2 ** (attempt - 1)))
+            df_m, err = _fetch_oasis_month(node_code, year, month)
+            if df_m is not None:
+                break
+            last_err = err or "unknown"
+        if df_m is None:
+            failures.append(f"M{month:02d}:{last_err}")
+        else:
+            frames.append(df_m)
+        # Rate-limit between months (even after success) to stay under
+        # CAISO's observed ~1-request-per-5s burst limit.
+        if month < 12:
+            time.sleep(rate_limit_s)
+
+    if not frames:
+        return None, f"all 12 months failed ({failures[0] if failures else 'unknown'})"
+
     df = pd.concat(frames).sort_values("ts").reset_index(drop=True)
     if len(df) < HOURS_PER_YEAR - 48:
-        return None
+        return None, f"incomplete year ({len(df)} rows; failed: {'; '.join(failures) or 'none'})"
     df = df.head(HOURS_PER_YEAR).reset_index(drop=True)
     df["Hour"] = np.arange(1, len(df) + 1)
-    return df[["Hour", "Nodal_Price_$/MWh"]]
+    status = "ok" if not failures else f"partial ({len(failures)} months failed)"
+    return df[["Hour", "Nodal_Price_$/MWh"]], status
 
 
 def _merge_live_prices_with_site_profile(live_prices: pd.DataFrame,
@@ -242,21 +307,43 @@ def load_energy_data(node_code: str, year: int,
         return DataBundle(df=df, source=f"Cached live CAISO OASIS — {node_code} {year} "
                                        f"(fetched {mtime})", is_live=True)
 
+    # Repo-shipped pre-fetched OASIS cache (preferred over live fetch on
+    # cold-start because OASIS rate-limits shared cloud egress IPs).
+    if not refresh:
+        bundled_parquet = _bundled_parquet_path(node_code, year)
+        if bundled_parquet.exists():
+            df = pd.read_parquet(bundled_parquet)
+            mtime = datetime.fromtimestamp(bundled_parquet.stat().st_mtime).strftime("%Y-%m-%d")
+            return DataBundle(
+                df=df,
+                source=f"Bundled CAISO OASIS — {node_code} {year} "
+                       f"(pre-fetched {mtime})",
+                is_live=True,
+            )
+
+    last_fetch_status = ""
     if refresh or not cache_path.exists():
-        live = _fetch_oasis_year(node_code, year)
+        live, status = _fetch_oasis_year(node_code, year)
+        last_fetch_status = status
         if live is not None:
             fb = pd.read_csv(fallback_path)
             merged = _merge_live_prices_with_site_profile(live, fb)
             merged.to_parquet(cache_path)
-            return DataBundle(df=merged,
-                              source=f"Live CAISO OASIS — {node_code} {year} "
-                                     f"(fetched {datetime.now().strftime('%Y-%m-%d')})",
-                              is_live=True)
+            suffix = "" if status == "ok" else f" — {status}"
+            return DataBundle(
+                df=merged,
+                source=f"Live CAISO OASIS — {node_code} {year} "
+                       f"(fetched {datetime.now().strftime('%Y-%m-%d')}){suffix}",
+                is_live=True,
+            )
 
     # Fallback path
     df = pd.read_csv(fallback_path)
     mtime = datetime.fromtimestamp(fallback_path.stat().st_mtime).strftime("%Y-%m-%d")
-    return DataBundle(df=df,
-                      source=f"Using bundled {node_code} {year} fallback — "
-                             f"OASIS unreachable (generated {mtime})",
-                      is_live=False)
+    reason = last_fetch_status or "not attempted (cache miss without refresh)"
+    return DataBundle(
+        df=df,
+        source=f"Using bundled {node_code} {year} fallback — "
+               f"OASIS: {reason} (generated {mtime})",
+        is_live=False,
+    )
