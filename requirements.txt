@@ -4,3 +4,6 @@ numpy
 plotly
 pulp
 google-generativeai
+pyarrow
+requests
+numpy-financial
